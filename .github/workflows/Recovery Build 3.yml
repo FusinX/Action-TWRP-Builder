@@ -10,33 +10,35 @@ on:
       MANIFEST_BRANCH:
         description: 'MANIFEST_BRANCH'
         required: true
-        default: 'twrp-12.1'
+        default: 'twrp-11'
       DEVICE_TREE_URL:
         description: 'DEVICE_TREE_URL'
         required: true
-        default: 'https://github.com/TeamWin/android_device_asus_I003D'
+        default: 'https://github.com/FusinX/recovery_realme_RMX1931'
       DEVICE_TREE_BRANCH:
         description: 'DEVICE_TREE_BRANCH'
         required: true
-        default: 'android-12.1'
+        default: 'master'
       DEVICE_PATH:
         description: 'DEVICE_PATH'
         required: true
-        default: 'device/asus/I003D'
+        default: 'device/realme/RMX1931'
       COMMON_TREE_URL:
         description: 'COMMON_TREE_URL (if no common tree, leave blank)'
         required: false
+        default: 'https://github.com/TeamWin/android_device_qcom_twrp-common'
       COMMON_PATH:
         description: 'COMMON_PATH (if no common tree, leave blank)'
         required: false
+        default: 'device/qcom/twrp-common'
       DEVICE_NAME:
         description: 'DEVICE_NAME'
         required: true
-        default: 'I003D'
+        default: 'RMX1931'
       MAKEFILE_NAME:
         description: 'MAKEFILE_NAME'
         required: true
-        default: 'twrp_I003D'
+        default: 'twrp_RMX1931'
       BUILD_TARGET:
         description: 'BUILD_TARGET'
         required: true
@@ -48,9 +50,10 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     permissions:
       contents: write
+      actions: write
     steps:
     - name: Display Run Parameters
       run: |
@@ -68,8 +71,31 @@ jobs:
     - name: Check Out
       uses: actions/checkout@v4
 
-    - name: Cleanup
-      uses: rokibhasansagar/slimhub_actions@main
+    - name: Disk space before cleanup
+      run: |
+        echo "::group::df -h (before cleanup)"
+        df -h
+        echo "::endgroup::"
+
+    # Pinned to v10 (fc881a613ad2a34aca9c9624518214ebc21dfc0c). swap-size-mb is 0
+    # here because "Set Swap Space" below configures swap explicitly to 12GB;
+    # setting it in both places is redundant and the later step wins anyway.
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c # v10
+      with:
+        root-reserve-mb: 2048
+        swap-size-mb: 0
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        remove-docker-images: 'true'
+
+    - name: Disk space after cleanup
+      run: |
+        echo "::group::df -h (after cleanup)"
+        df -h
+        echo "::endgroup::"
 
     - name: Prepare the environment
       run: |
@@ -108,8 +134,8 @@ jobs:
         mkdir workspace
         cd workspace
         echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
-        git config --global user.name "Nico170420"
-        git config --global user.email "b170420nc@gmail.com"
+        git config --global user.name "FusinX"
+        git config --global user.email "fusinx@gmail.com"
         repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
       id: pwd
 
@@ -117,6 +143,12 @@ jobs:
       run: |
         repo sync -j$(nproc --all) --force-sync
       working-directory: workspace
+
+    - name: Disk space after repo sync
+      run: |
+        echo "::group::df -h (after repo sync)"
+        df -h
+        echo "::endgroup::"
 
     - name: Clone device tree
       run: |
@@ -153,12 +185,54 @@ jobs:
       with:
         swap-size-gb: 12
 
+    - name: Restore ccache
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.ccache
+        key: ccache-${{ github.event.inputs.DEVICE_NAME }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ github.event.inputs.DEVICE_NAME }}-${{ github.event.inputs.MANIFEST_BRANCH }}-
+
     - name: Building recovery
+      env:
+        USE_CCACHE: '1'
+        CCACHE_EXEC: /usr/bin/ccache
+        CCACHE_DIR: /home/runner/.ccache
       run: |
+        ccache -M 10G
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Disk space after build
+      if: always()
+      run: |
+        echo "::group::df -h (after build)"
+        df -h
+        echo "::endgroup::"
+
+    # actions/cache never overwrites an existing key, so a per-run_id save key
+    # would otherwise accumulate one new multi-GB cache entry every run against
+    # the repo's 10GB cache cap. This deletes prior entries for the same
+    # device/branch prefix before saving, so effectively one cache is kept
+    # per DEVICE_NAME+MANIFEST_BRANCH combination instead of one per run.
+    - name: Prune stale ccache entries
+      if: always()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh cache list --key "ccache-${{ github.event.inputs.DEVICE_NAME }}-${{ github.event.inputs.MANIFEST_BRANCH }}-" --json id --jq '.[].id' | \
+        while read -r id; do
+          gh cache delete "$id" || true
+        done
+
+    - name: Save ccache
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.ccache
+        key: ccache-${{ github.event.inputs.DEVICE_NAME }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.run_id }}
 
     - name: Upload to Release
       uses: softprops/action-gh-release@v2
@@ -168,7 +242,7 @@ jobs:
           workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
           workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
-        tag_name: ${{ github.run_id }}
+        tag_name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         body: |
           Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
           Device: ${{ github.event.inputs.DEVICE_NAME }}
